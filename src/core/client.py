@@ -95,7 +95,31 @@ class OpenAIClient:
                 default_headers=all_headers
             )
         self.active_requests: Dict[str, asyncio.Event] = {}
-    
+
+    def _handle_api_exception(self, e: Exception) -> None:
+        """Convert OpenAI SDK exceptions to FastAPI HTTPException.
+
+        Centralizes error mapping used by both streaming and non-streaming paths.
+        HTTPException passes through unchanged to avoid double-wrapping.
+        """
+        if isinstance(e, HTTPException):
+            raise e
+        if isinstance(e, AuthenticationError):
+            raise HTTPException(status_code=401, detail=self.classify_openai_error(str(e)))
+        if isinstance(e, RateLimitError):
+            raise HTTPException(status_code=429, detail=self.classify_openai_error(str(e)))
+        if isinstance(e, BadRequestError):
+            raise HTTPException(status_code=400, detail=self.classify_openai_error(str(e)))
+        if isinstance(e, APIError):
+            status_code = getattr(e, 'status_code', 500)
+            if status_code in (502, 503, 504):
+                raise HTTPException(
+                    status_code=status_code,
+                    detail=f"Upstream service temporarily unavailable (HTTP {status_code}). Please retry in a few moments."
+                )
+            raise HTTPException(status_code=status_code, detail=self.classify_openai_error(str(e)))
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+
     async def create_chat_completion(self, request: Dict[str, Any], request_id: Optional[str] = None) -> Dict[str, Any]:
         """Send chat completion to OpenAI API with cancellation support and transient error retries."""
 
@@ -136,24 +160,8 @@ class OpenAIClient:
 
             return completion.model_dump()
 
-        except AuthenticationError as e:
-            raise HTTPException(status_code=401, detail=self.classify_openai_error(str(e)))
-        except RateLimitError as e:
-            raise HTTPException(status_code=429, detail=self.classify_openai_error(str(e)))
-        except BadRequestError as e:
-            raise HTTPException(status_code=400, detail=self.classify_openai_error(str(e)))
-        except APIError as e:
-            status_code = getattr(e, 'status_code', 500)
-            if status_code in (502, 503, 504):
-                raise HTTPException(
-                    status_code=status_code,
-                    detail=f"Upstream service temporarily unavailable (HTTP {status_code}). Please retry in a few moments."
-                )
-            raise HTTPException(status_code=status_code, detail=self.classify_openai_error(str(e)))
-        except HTTPException:
-            raise
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+            self._handle_api_exception(e)
 
         finally:
             if request_id and request_id in self.active_requests:
@@ -194,23 +202,9 @@ class OpenAIClient:
             
             # Signal end of stream
             yield "data: [DONE]"
-                
-        except AuthenticationError as e:
-            raise HTTPException(status_code=401, detail=self.classify_openai_error(str(e)))
-        except RateLimitError as e:
-            raise HTTPException(status_code=429, detail=self.classify_openai_error(str(e)))
-        except BadRequestError as e:
-            raise HTTPException(status_code=400, detail=self.classify_openai_error(str(e)))
-        except APIError as e:
-            status_code = getattr(e, 'status_code', 500)
-            if status_code in (502, 503, 504):
-                raise HTTPException(
-                    status_code=status_code,
-                    detail=f"Upstream service temporarily unavailable (HTTP {status_code}). Please retry in a few moments."
-                )
-            raise HTTPException(status_code=status_code, detail=self.classify_openai_error(str(e)))
+
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+            self._handle_api_exception(e)
 
         finally:
             # Clean up active request tracking

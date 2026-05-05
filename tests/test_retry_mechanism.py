@@ -206,3 +206,139 @@ class TestRetryIntegration:
 
         assert result == "success"
         assert call_count == 3
+
+
+class TestHandleApiException:
+    """Tests for _handle_api_exception — the centralized error mapping method."""
+
+    @pytest.fixture
+    def client(self):
+        """Create an OpenAIClient for testing _handle_api_exception."""
+        from unittest.mock import patch as _patch
+        with _patch.dict('os.environ', {
+            'OPENAI_API_KEY': 'sk-test123',
+            'OPENAI_BASE_URL': 'http://test'
+        }):
+            from src.core.client import OpenAIClient
+            return OpenAIClient('sk-test123', 'http://test')
+
+    @pytest.mark.asyncio
+    async def test_authentication_error_maps_to_401(self, client):
+        """AuthenticationError should be converted to HTTPException(401)."""
+        from fastapi import HTTPException
+        exc = AuthenticationError(
+            message="Unauthorized",
+            response=MagicMock(status_code=401),
+            body={"error": {"type": "authentication_error"}}
+        )
+        with pytest.raises(HTTPException) as exc_info:
+            client._handle_api_exception(exc)
+        assert exc_info.value.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_error_maps_to_429(self, client):
+        """RateLimitError should be converted to HTTPException(429)."""
+        from fastapi import HTTPException
+        exc = RateLimitError(
+            message="Rate limited",
+            response=MagicMock(status_code=429),
+            body={"error": {"type": "rate_limit_error"}}
+        )
+        with pytest.raises(HTTPException) as exc_info:
+            client._handle_api_exception(exc)
+        assert exc_info.value.status_code == 429
+
+    @pytest.mark.asyncio
+    async def test_bad_request_error_maps_to_400(self, client):
+        """BadRequestError should be converted to HTTPException(400)."""
+        from fastapi import HTTPException
+        exc = BadRequestError(
+            message="Bad request",
+            response=MagicMock(status_code=400),
+            body={"error": {"type": "invalid_request_error"}}
+        )
+        with pytest.raises(HTTPException) as exc_info:
+            client._handle_api_exception(exc)
+        assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_502_api_error_includes_service_unavailable_message(self, client):
+        """502/503/504 APIError should use specific unavailable message."""
+        from fastapi import HTTPException
+        exc = APIError(message="Bad gateway", request=MagicMock(), body=None)
+        exc.status_code = 502
+        with pytest.raises(HTTPException) as exc_info:
+            client._handle_api_exception(exc)
+        assert exc_info.value.status_code == 502
+        assert "temporarily unavailable" in exc_info.value.detail
+
+    @pytest.mark.asyncio
+    async def test_http_exception_passes_through_unchanged(self, client):
+        """HTTPException must NOT be wrapped or converted — it should pass through as-is.
+
+        This prevents the bug where streaming method's `except Exception` catches
+        HTTPException and incorrectly converts it to HTTP 500.
+        """
+        from fastapi import HTTPException
+        original = HTTPException(status_code=422, detail="Unprocessable entity")
+        with pytest.raises(HTTPException) as exc_info:
+            client._handle_api_exception(original)
+        assert exc_info.value.status_code == 422
+        assert exc_info.value.detail == "Unprocessable entity"
+
+
+class TestRetryEdgeCases:
+    """Regression tests for retry edge cases (tests existing behavior)."""
+
+    @pytest.mark.asyncio
+    async def test_403_forbidden_no_retry(self, mock_coro_factory):
+        """403 Forbidden is fatal — must NOT retry."""
+        err = APIError(message="Forbidden", request=MagicMock(), body=None)
+        err.status_code = 403
+        mock_coro_factory.side_effect = err
+
+        with pytest.raises(APIError):
+            await _retry_with_backoff(mock_coro_factory, max_retries=3)
+
+        assert mock_coro_factory.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_404_retried(self, mock_coro_factory):
+        """404 is transient for load-balanced APIs — should retry."""
+        err1 = APIError(message="Not Found", request=MagicMock(), body=None)
+        err1.status_code = 404
+        mock_coro_factory.side_effect = [err1, "success"]
+
+        with patch('src.core.client.asyncio.sleep', new_callable=AsyncMock) as mock_sleep:
+            result = await _retry_with_backoff(mock_coro_factory, max_retries=3)
+
+        assert result == "success"
+        assert mock_coro_factory.call_count == 2
+        assert mock_sleep.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_exhausted(self, mock_coro_factory):
+        """RateLimitError should raise after all retries exhausted."""
+        mock_coro_factory.side_effect = RateLimitError(
+            message="Rate limited",
+            response=MagicMock(status_code=429),
+            body={"error": {"type": "rate_limit_error"}}
+        )
+
+        with patch('src.core.client.asyncio.sleep', new_callable=AsyncMock):
+            with pytest.raises(RateLimitError):
+                await _retry_with_backoff(mock_coro_factory, max_retries=2)
+
+        assert mock_coro_factory.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_max_retries_zero_no_retry(self, mock_coro_factory):
+        """With max_retries=0, should attempt once and fail immediately."""
+        err = APIError(message="Server error", request=MagicMock(), body=None)
+        err.status_code = 500
+        mock_coro_factory.side_effect = err
+
+        with pytest.raises(APIError):
+            await _retry_with_backoff(mock_coro_factory, max_retries=0)
+
+        assert mock_coro_factory.call_count == 1
