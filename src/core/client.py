@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import random
 from fastapi import HTTPException
 from typing import Optional, AsyncGenerator, Dict, Any
@@ -8,41 +9,46 @@ from openai.types.chat import ChatCompletion, ChatCompletionChunk
 from openai._exceptions import APIError, RateLimitError, AuthenticationError, BadRequestError
 from src.core.config import config
 
-# Transient upstream errors that should be retried (same ones OpenAI SDK retries,
-# plus 404 which is common with load-balanced third-party APIs)
-TRANSIENT_STATUS_CODES = {404, 429, 500, 502, 503, 504}
+logger = logging.getLogger(__name__)
 
 # Errors that must never be retried
 FATAL_STATUS_CODES = {401, 403, 400}
-
-
-def _is_transient_error(exc: APIError) -> bool:
-    """Check if an API error is transient and worth retrying."""
-    status = getattr(exc, 'status_code', 500)
-    return status in TRANSIENT_STATUS_CODES
 
 
 async def _retry_with_backoff(coro_factory, max_retries: int, label: str = ""):
     """Retry an async callable with exponential backoff + jitter for transient errors.
 
     coro_factory is a zero-arg callable that returns a fresh coroutine each attempt.
-    Non-transient errors are raised immediately on first failure.
+    Retries on: APIError with transient status codes (429, 404, 500, 502, 503, 504).
+    RateLimitError (429) uses a longer backoff (base 2s) than other transient errors (base 1s).
+    Non-transient / fatal errors are raised immediately on first failure.
+    Only retries during connection phase — once a response stream starts, errors are not retried.
     """
     last_exc = None
     for attempt in range(max_retries + 1):
         try:
             return await coro_factory()
-        except (AuthenticationError, RateLimitError, BadRequestError):
+        except RateLimitError as e:
+            last_exc = e
+            if attempt >= max_retries:
+                raise
+            # Rate limit: longer base delay (2s, 4s, 8s...) + jitter
+            delay = min(2 ** (attempt + 1), 8) + random.uniform(0, 1)
+            logger.info(
+                f"Rate limited (429), retrying in {delay:.1f}s "
+                f"(attempt {attempt + 1}/{max_retries}) {label}"
+            )
+            await asyncio.sleep(delay)
+        except (AuthenticationError, BadRequestError):
             raise  # never retry client errors
         except APIError as e:
             last_exc = e
             status = getattr(e, 'status_code', 500)
             if status in FATAL_STATUS_CODES or attempt >= max_retries:
                 raise
-            # Exponential backoff: 1s, 2s, 4s ...  with jitter
+            # Transient error backoff: 1s, 2s, 4s... capped at 8s + jitter
             delay = min(2 ** attempt, 8) + random.uniform(0, 1)
-            import logging
-            logging.getLogger(__name__).info(
+            logger.info(
                 f"Transient error {status}, retrying in {delay:.1f}s "
                 f"(attempt {attempt + 1}/{max_retries}) {label}"
             )
@@ -69,13 +75,15 @@ class OpenAIClient:
         all_headers = {**default_headers, **self.custom_headers}
         
         # Detect if using Azure and instantiate the appropriate client
+        # SDK retry is disabled (max_retries=0) because _retry_with_backoff handles retries.
+        # Enabling both would cause exponential retry multiplication (SDK retries × our retries).
         if api_version:
             self.client = AsyncAzureOpenAI(
                 api_key=api_key,
                 azure_endpoint=base_url,
                 api_version=api_version,
                 timeout=timeout,
-                max_retries=config.max_retries,
+                max_retries=0,
                 default_headers=all_headers
             )
         else:
@@ -83,7 +91,7 @@ class OpenAIClient:
                 api_key=api_key,
                 base_url=base_url,
                 timeout=timeout,
-                max_retries=config.max_retries,
+                max_retries=0,
                 default_headers=all_headers
             )
         self.active_requests: Dict[str, asyncio.Event] = {}
@@ -195,10 +203,15 @@ class OpenAIClient:
             raise HTTPException(status_code=400, detail=self.classify_openai_error(str(e)))
         except APIError as e:
             status_code = getattr(e, 'status_code', 500)
+            if status_code in (502, 503, 504):
+                raise HTTPException(
+                    status_code=status_code,
+                    detail=f"Upstream service temporarily unavailable (HTTP {status_code}). Please retry in a few moments."
+                )
             raise HTTPException(status_code=status_code, detail=self.classify_openai_error(str(e)))
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
-        
+
         finally:
             # Clean up active request tracking
             if request_id and request_id in self.active_requests:

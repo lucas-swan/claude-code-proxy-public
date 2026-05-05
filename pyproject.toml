@@ -55,6 +55,10 @@ dev = [
     "pyinstaller>=6.15.0",
 ]
 
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["."]
+
 [tool.black]
 line-length = 100
 target-version = ['py38']
