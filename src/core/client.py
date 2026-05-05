@@ -5,6 +5,7 @@ from typing import Optional, AsyncGenerator, Dict, Any
 from openai import AsyncOpenAI, AsyncAzureOpenAI
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
 from openai._exceptions import APIError, RateLimitError, AuthenticationError, BadRequestError
+from src.core.config import config
 
 class OpenAIClient:
     """Async OpenAI client with cancellation support."""
@@ -30,6 +31,7 @@ class OpenAIClient:
                 azure_endpoint=base_url,
                 api_version=api_version,
                 timeout=timeout,
+                max_retries=config.max_retries,
                 default_headers=all_headers
             )
         else:
@@ -37,6 +39,7 @@ class OpenAIClient:
                 api_key=api_key,
                 base_url=base_url,
                 timeout=timeout,
+                max_retries=config.max_retries,
                 default_headers=all_headers
             )
         self.active_requests: Dict[str, asyncio.Event] = {}
@@ -91,6 +94,12 @@ class OpenAIClient:
             raise HTTPException(status_code=400, detail=self.classify_openai_error(str(e)))
         except APIError as e:
             status_code = getattr(e, 'status_code', 500)
+            # Special handling for upstream gateway errors (502/503/504)
+            if status_code in (502, 503, 504):
+                raise HTTPException(
+                    status_code=status_code,
+                    detail=f"Upstream service temporarily unavailable (HTTP {status_code}). Please retry in a few moments."
+                )
             raise HTTPException(status_code=status_code, detail=self.classify_openai_error(str(e)))
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")

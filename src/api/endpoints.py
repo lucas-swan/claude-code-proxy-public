@@ -12,6 +12,7 @@ from src.conversion.request_converter import convert_claude_to_openai
 from src.conversion.response_converter import (
     convert_openai_to_claude_response,
     convert_openai_streaming_to_claude_with_cancellation,
+    build_sse_error_message,
 )
 from src.core.model_manager import model_manager
 
@@ -68,40 +69,50 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
             raise HTTPException(status_code=499, detail="Client disconnected")
 
         if request.stream:
-            # Streaming response - wrap in error handling
-            try:
-                openai_stream = openai_client.create_chat_completion_stream(
-                    openai_request, request_id
-                )
-                return StreamingResponse(
-                    convert_openai_streaming_to_claude_with_cancellation(
+            # Streaming response - always return SSE stream, even on error
+            # Claude Code expects SSE format, not JSON error responses
+            async def streaming_response_with_fallback():
+                try:
+                    openai_stream = openai_client.create_chat_completion_stream(
+                        openai_request, request_id
+                    )
+                    async for chunk in convert_openai_streaming_to_claude_with_cancellation(
                         openai_stream,
                         request,
                         logger,
                         http_request,
                         openai_client,
                         request_id,
-                    ),
-                    media_type="text/event-stream",
-                    headers={
-                        "Cache-Control": "no-cache",
-                        "Connection": "keep-alive",
-                        "Access-Control-Allow-Origin": "*",
-                        "Access-Control-Allow-Headers": "*",
-                    },
-                )
-            except HTTPException as e:
-                # Convert to proper error response for streaming
-                logger.error(f"Streaming error: {e.detail}")
-                import traceback
+                        openai_request.get('model', 'unknown'),
+                    ):
+                        yield chunk
+                except HTTPException as e:
+                    logger.error(
+                        f"Pre-stream error: {e.status_code} | "
+                        f"model={request.model} -> {openai_request.get('model', 'unknown')} | "
+                        f"endpoint={openai_client.base_url} | "
+                        f"detail={e.detail}"
+                    )
+                    error_msg = openai_client.classify_openai_error(e.detail)
+                    async for chunk in build_sse_error_message(request.model, error_msg):
+                        yield chunk
+                except Exception as e:
+                    logger.error(f"Unexpected pre-stream error: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    async for chunk in build_sse_error_message(request.model, f"Internal server error: {str(e)}"):
+                        yield chunk
 
-                logger.error(traceback.format_exc())
-                error_message = openai_client.classify_openai_error(e.detail)
-                error_response = {
-                    "type": "error",
-                    "error": {"type": "api_error", "message": error_message},
-                }
-                return JSONResponse(status_code=e.status_code, content=error_response)
+            return StreamingResponse(
+                streaming_response_with_fallback(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Headers": "*",
+                },
+            )
         else:
             # Non-streaming response
             openai_response = await openai_client.create_chat_completion(
@@ -158,6 +169,19 @@ async def count_tokens(request: ClaudeTokenCountRequest, _: None = Depends(valid
     except Exception as e:
         logger.error(f"Error counting tokens: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/v1/models")
+async def list_models():
+    """Stub /v1/models endpoint to satisfy Claude Code startup probe."""
+    return {
+        "object": "list",
+        "data": [
+            {"id": config.big_model, "object": "model", "owned_by": "proxy"},
+            {"id": config.middle_model, "object": "model", "owned_by": "proxy"},
+            {"id": config.small_model, "object": "model", "owned_by": "proxy"},
+        ],
+    }
 
 
 @router.get("/health")

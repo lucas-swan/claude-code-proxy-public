@@ -5,6 +5,22 @@ from src.core.constants import Constants
 from src.models.claude import ClaudeMessagesRequest
 
 
+async def build_sse_error_message(model: str, error_text: str):
+    """Build a complete SSE error message that Claude Code can properly parse.
+
+    Instead of using `event: error` (which Claude Code may not display correctly),
+    this constructs a full Claude protocol message with the error as text content.
+    """
+    message_id = f"msg_{uuid.uuid4().hex[:24]}"
+    yield f"event: {Constants.EVENT_MESSAGE_START}\ndata: {json.dumps({'type': Constants.EVENT_MESSAGE_START, 'message': {'id': message_id, 'type': 'message', 'role': Constants.ROLE_ASSISTANT, 'model': model, 'content': [], 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': 0, 'output_tokens': 0}}}, ensure_ascii=False)}\n\n"
+    yield f"event: {Constants.EVENT_CONTENT_BLOCK_START}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_START, 'index': 0, 'content_block': {'type': Constants.CONTENT_TEXT, 'text': ''}}, ensure_ascii=False)}\n\n"
+    yield f"event: {Constants.EVENT_PING}\ndata: {json.dumps({'type': Constants.EVENT_PING}, ensure_ascii=False)}\n\n"
+    yield f"event: {Constants.EVENT_CONTENT_BLOCK_DELTA}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_DELTA, 'index': 0, 'delta': {'type': Constants.DELTA_TEXT, 'text': f'[Error] {error_text}'}}, ensure_ascii=False)}\n\n"
+    yield f"event: {Constants.EVENT_CONTENT_BLOCK_STOP}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_STOP, 'index': 0}, ensure_ascii=False)}\n\n"
+    yield f"event: {Constants.EVENT_MESSAGE_DELTA}\ndata: {json.dumps({'type': Constants.EVENT_MESSAGE_DELTA, 'delta': {'stop_reason': Constants.STOP_END_TURN, 'stop_sequence': None}, 'usage': {'input_tokens': 0, 'output_tokens': 0}}, ensure_ascii=False)}\n\n"
+    yield f"event: {Constants.EVENT_MESSAGE_STOP}\ndata: {json.dumps({'type': Constants.EVENT_MESSAGE_STOP}, ensure_ascii=False)}\n\n"
+
+
 def convert_openai_to_claude_response(
     openai_response: dict, original_request: ClaudeMessagesRequest
 ) -> dict:
@@ -79,7 +95,7 @@ def convert_openai_to_claude_response(
 
 
 async def convert_openai_streaming_to_claude(
-    openai_stream, original_request: ClaudeMessagesRequest, logger
+    openai_stream, original_request: ClaudeMessagesRequest, logger, openai_client=None
 ):
     """Convert OpenAI streaming response to Claude streaming format."""
 
@@ -188,17 +204,43 @@ async def convert_openai_streaming_to_claude(
                             final_stop_reason = Constants.STOP_END_TURN
                         break
 
+    except HTTPException as e:
+        # Handle HTTP exceptions from upstream (e.g., 404 model not found, 401 auth error)
+        # Must convert to complete SSE message instead of re-raising to avoid
+        # "Caught handled exception, but response already started" RuntimeError
+        if openai_client:
+            logger.error(
+                f"Upstream HTTP error: {e.status_code} | "
+                f"model={original_request.model} | "
+                f"endpoint={openai_client.base_url} | "
+                f"detail={e.detail}"
+            )
+            error_msg = (
+                f"Upstream API error {e.status_code}: {e.detail} | "
+                f"model={original_request.model} | "
+                f"endpoint={openai_client.base_url}"
+            )
+        else:
+            logger.error(
+                f"Upstream HTTP error: {e.status_code} | "
+                f"model={original_request.model} | "
+                f"detail={e.detail}"
+            )
+            error_msg = (
+                f"Upstream API error {e.status_code}: {e.detail} | "
+                f"model={original_request.model}"
+            )
+        async for chunk in build_sse_error_message(original_request.model, error_msg):
+            yield chunk
+        return
     except Exception as e:
         # Handle any streaming errors gracefully
         logger.error(f"Streaming error: {e}")
         import traceback
 
         logger.error(traceback.format_exc())
-        error_event = {
-            "type": "error",
-            "error": {"type": "api_error", "message": f"Streaming error: {str(e)}"},
-        }
-        yield f"event: error\ndata: {json.dumps(error_event, ensure_ascii=False)}\n\n"
+        async for chunk in build_sse_error_message(original_request.model, f"Streaming error: {str(e)}"):
+            yield chunk
         return
 
     # Send final SSE events
@@ -220,6 +262,7 @@ async def convert_openai_streaming_to_claude_with_cancellation(
     http_request: Request,
     openai_client,
     request_id: str,
+    mapped_model: str = None,
 ):
     """Convert OpenAI streaming response to Claude streaming format with cancellation support."""
 
@@ -347,31 +390,36 @@ async def convert_openai_streaming_to_claude_with_cancellation(
                             final_stop_reason = Constants.STOP_END_TURN
 
     except HTTPException as e:
-        # Handle cancellation
+        # Handle HTTP exceptions from upstream (e.g., 404 model not found, 401 auth error, 499 cancellation)
+        # Must convert to complete SSE message instead of re-raising to avoid
+        # "Caught handled exception, but response already started" RuntimeError
         if e.status_code == 499:
             logger.info(f"Request {request_id} was cancelled")
-            error_event = {
-                "type": "error",
-                "error": {
-                    "type": "cancelled",
-                    "message": "Request was cancelled by client",
-                },
-            }
-            yield f"event: error\ndata: {json.dumps(error_event, ensure_ascii=False)}\n\n"
-            return
+            error_msg = "Request was cancelled by client"
         else:
-            raise
+            model_display = f"{original_request.model} -> {mapped_model}" if mapped_model else original_request.model
+            logger.error(
+                f"Upstream HTTP error: {e.status_code} | "
+                f"model={model_display} | "
+                f"endpoint={openai_client.base_url} | "
+                f"detail={e.detail}"
+            )
+            error_msg = (
+                f"Upstream API error {e.status_code}: {e.detail} | "
+                f"model={model_display} | "
+                f"endpoint={openai_client.base_url}"
+            )
+        async for chunk in build_sse_error_message(original_request.model, error_msg):
+            yield chunk
+        return
     except Exception as e:
         # Handle any streaming errors gracefully
         logger.error(f"Streaming error: {e}")
         import traceback
 
         logger.error(traceback.format_exc())
-        error_event = {
-            "type": "error",
-            "error": {"type": "api_error", "message": f"Streaming error: {str(e)}"},
-        }
-        yield f"event: error\ndata: {json.dumps(error_event, ensure_ascii=False)}\n\n"
+        async for chunk in build_sse_error_message(original_request.model, f"Streaming error: {str(e)}"):
+            yield chunk
         return
 
     # Send final SSE events
