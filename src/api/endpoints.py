@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Request, Header, Depends
 from fastapi.responses import JSONResponse, StreamingResponse
 from datetime import datetime
+import json
 import uuid
 from typing import Optional
 
@@ -11,7 +12,7 @@ from src.models.claude import ClaudeMessagesRequest, ClaudeTokenCountRequest
 from src.conversion.request_converter import convert_claude_to_openai
 from src.conversion.response_converter import (
     convert_openai_to_claude_response,
-    convert_openai_streaming_to_claude_with_cancellation,
+    convert_openai_streaming_to_claude,
     build_sse_error_message,
 )
 from src.core.model_manager import model_manager
@@ -76,14 +77,14 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
                     openai_stream = openai_client.create_chat_completion_stream(
                         openai_request, request_id
                     )
-                    async for chunk in convert_openai_streaming_to_claude_with_cancellation(
+                    async for chunk in convert_openai_streaming_to_claude(
                         openai_stream,
                         request,
                         logger,
-                        http_request,
-                        openai_client,
-                        request_id,
-                        openai_request.get('model', 'unknown'),
+                        openai_client=openai_client,
+                        http_request=http_request,
+                        request_id=request_id,
+                        mapped_model=openai_request.get('model', 'unknown'),
                     ):
                         yield chunk
                 except HTTPException as e:
@@ -109,8 +110,6 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
                 headers={
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
-                    "Access-Control-Allow-Origin": "*",
-                    "Access-Control-Allow-Headers": "*",
                 },
             )
         else:
@@ -133,38 +132,55 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
         raise HTTPException(status_code=500, detail=error_message)
 
 
+def _estimate_tokens(text: str) -> int:
+    """Estimate token count based on text content.
+    Uses a mixed heuristic: ~4 chars/token for ASCII, ~1.5 chars/token for CJK.
+    """
+    if not text:
+        return 0
+    cjk_count = sum(1 for c in text if '一' <= c <= '鿿' or '぀' <= c <= 'ヿ' or '가' <= c <= '힯')
+    ascii_count = len(text) - cjk_count
+    return max(1, int(cjk_count / 1.5 + ascii_count / 4))
+
+
 @router.post("/v1/messages/count_tokens")
 async def count_tokens(request: ClaudeTokenCountRequest, _: None = Depends(validate_api_key)):
     try:
-        # For token counting, we'll use a simple estimation
-        # In a real implementation, you might want to use tiktoken or similar
+        total_tokens = 0
 
-        total_chars = 0
-
-        # Count system message characters
+        # System message overhead
         if request.system:
             if isinstance(request.system, str):
-                total_chars += len(request.system)
+                total_tokens += _estimate_tokens(request.system)
             elif isinstance(request.system, list):
                 for block in request.system:
                     if hasattr(block, "text"):
-                        total_chars += len(block.text)
+                        total_tokens += _estimate_tokens(block.text)
+            total_tokens += 4
 
-        # Count message characters
+        # Message tokens
         for msg in request.messages:
             if msg.content is None:
-                continue
+                total_tokens += 1
             elif isinstance(msg.content, str):
-                total_chars += len(msg.content)
+                total_tokens += _estimate_tokens(msg.content)
             elif isinstance(msg.content, list):
                 for block in msg.content:
                     if hasattr(block, "text") and block.text is not None:
-                        total_chars += len(block.text)
+                        total_tokens += _estimate_tokens(block.text)
+                    elif hasattr(block, "source") and isinstance(block.source, dict):
+                        total_tokens += 85
+            total_tokens += 4
 
-        # Rough estimation: 4 characters per token
-        estimated_tokens = max(1, total_chars // 4)
+        # Tool definitions overhead
+        if request.tools:
+            for tool in request.tools:
+                total_tokens += _estimate_tokens(tool.name) + _estimate_tokens(tool.description or "")
+                if tool.input_schema:
+                    total_tokens += _estimate_tokens(json.dumps(tool.input_schema))
+                total_tokens += 6
 
-        return {"input_tokens": estimated_tokens}
+        return {"input_tokens": max(1, total_tokens)}
 
     except Exception as e:
         logger.error(f"Error counting tokens: {e}")

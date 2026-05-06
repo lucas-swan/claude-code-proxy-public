@@ -34,9 +34,6 @@ class Config:
         """Basic API key validation"""
         if not self.openai_api_key:
             return False
-        # Basic format check for OpenAI API keys
-        if not self.openai_api_key.startswith('sk-'):
-            return False
         return True
         
     def validate_client_api_key(self, client_api_key):
@@ -73,5 +70,5 @@ try:
     config = Config()
     print(f" Configuration loaded: API_KEY={'*' * 20}..., BASE_URL='{config.openai_base_url}'")
 except Exception as e:
-    print(f"=4 Configuration Error: {e}")
+    print(f"!! Configuration Error: {e}")
     sys.exit(1)

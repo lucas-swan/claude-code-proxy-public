@@ -91,6 +91,8 @@ def convert_claude_to_openai(
         openai_request["stop"] = claude_request.stop_sequences
     if claude_request.top_p is not None:
         openai_request["top_p"] = claude_request.top_p
+    if claude_request.top_k is not None:
+        logger.warning(f"top_k={claude_request.top_k} is not supported by OpenAI API and will be ignored")
 
     # Convert tools
     if claude_request.tools:
@@ -111,6 +113,8 @@ def convert_claude_to_openai(
             openai_request["tools"] = openai_tools
 
     # Convert tool choice
+    # Note: thinking and top_k are accepted by ClaudeMessagesRequest but intentionally
+    # excluded from the OpenAI request as the OpenAI API has no equivalent parameters.
     if claude_request.tool_choice:
         choice_type = claude_request.tool_choice.get("type")
         if choice_type == "auto":
